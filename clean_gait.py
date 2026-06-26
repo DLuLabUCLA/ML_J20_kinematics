@@ -11,13 +11,17 @@ Pipeline Stages
 4.  Short-gap interpolation (linear, ≤ max_gap frames)
 5.  Bout detection via composite motion score:
       - ankle + foot x-velocity weighted by likelihood
-      - rolling median smoothing to find sustained motion regions
-      - contiguous active regions above threshold → candidate bouts
+      - rolling median smoothing + hysteresis to find sustained motion regions
+      - close inactive gaps are merged so W06-style recovery stepping is not
+        split into many tiny fragments
 6.  Bout quality filter:
       - minimum duration
       - require periodic x-signal (sawtooth = treadmill stepping)
 7.  Within-bout Savitzky-Golay smoothing
 8.  Export: cleaned CSV, bout metadata CSV, 5 diagnostic plots
+
+Bout metadata includes duration, fraction of total recording time, estimated
+step count, and step frequency (steps/second).
 
 Stepping vs Dragging
 --------------------
@@ -38,12 +42,25 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from pathlib import Path
+import os
 
 # ─────────────────────────── CONFIG ────────────────────────────
-INPUT_DIR = Path("./Week6")
-OUT_DIR     = Path("./Week6/Cleaned")
+INPUT_DIR = Path(os.environ.get("GAIT_INPUT_DIR", "./Week6"))
+if not INPUT_DIR.exists():
+    INPUT_DIR = Path(".")
+OUT_DIR = Path(os.environ.get("GAIT_OUT_DIR", str(INPUT_DIR / "Cleaned")))
 
-for INPUT_CSV in INPUT_DIR.glob("*.csv"):
+INPUT_FILES = sorted(
+    p for p in INPUT_DIR.glob("*.csv")
+    if not p.name.endswith("_cleaned_gait_data.csv")
+    and p.name != "cleaned_gait_data.csv"
+    and not p.name.endswith("_bout_metadata.csv")
+)
+
+if not INPUT_FILES:
+    print(f"No raw DLC CSV files found in {INPUT_DIR.resolve()}")
+
+for INPUT_CSV in INPUT_FILES:
     print(f"Processing: {INPUT_CSV.name}")
 
     # Likelihood filtering  ─────────────────────────────────────────
@@ -65,10 +82,25 @@ for INPUT_CSV in INPUT_DIR.glob("*.csv"):
     # Bout detection  ──────────────────────────────────────────────
     # Composite motion score = weighted sum of ankle + foot x-velocity
     # (x captures treadmill belt direction; y captures step height)
-    MOTION_ROLL_WINDOW   = 7        # rolling median window for smoothing signal
-    MOTION_THRESH        = 2.5      # minimum composite score to be 'active'
-    MOTION_DILATION_FRAMES = 5      # expand active mask by N frames each side (join near-bouts)
-    MIN_BOUT_FRAMES      = 20       # discard bouts shorter than this
+    FRAME_RATE           = 15.10    # frames/second; used for bout duration and step frequency
+    MOTION_ROLL_WINDOW   = 11       # rolling median window for smoothing signal
+    MOTION_THRESH        = 2.5      # high threshold: starts/anchors an active stepping bout
+    MOTION_OFF_THRESH    = 1.25     # low threshold: keeps an existing bout alive through dips
+    MOTION_DILATION_FRAMES = 3      # expand active mask by N frames each side
+    MAX_INACTIVE_GAP_FRAMES = 30    # merge bouts separated by <= this many inactive frames
+    MIN_BOUT_FRAMES      = 30       # discard very short fragments after merging
+    MIN_STEPS_PER_BOUT   = 0        # set >0 to discard fragments with too few step cycles
+    MIN_STEP_INTERVAL_SEC = 0.18    # fastest plausible interval between same-foot cycles
+    HIGH_CONFIDENCE_MEAN_LIKELIHOOD = 0.95
+
+    # Legacy settings are kept for lower-confidence W00-style files where the
+    # original, more local bout splitting was already useful.
+    LEGACY_MOTION_ROLL_WINDOW = 7
+    LEGACY_MOTION_OFF_THRESH = MOTION_THRESH
+    LEGACY_MOTION_DILATION_FRAMES = 5
+    LEGACY_MAX_INACTIVE_GAP_FRAMES = 0
+    LEGACY_MIN_BOUT_FRAMES = 20
+    LEGACY_MIN_STEPS_PER_BOUT = 0
     
     # Step quality scoring  ────────────────────────────────────────
     # Spectral regularity of foot x signal within a bout
@@ -131,12 +163,13 @@ for INPUT_CSV in INPUT_DIR.glob("*.csv"):
             for coord in ["x", "y"]:
                 col = f"{p}_{coord}"
                 s = df[col].copy()
-                notna = s.notna()
-                gap_id = (~notna).cumsum()
-                gap_sizes = (~notna).groupby(gap_id).transform("sum")
+                is_na = s.isna()
+                gap_id = is_na.ne(is_na.shift(fill_value=False)).cumsum()
+                gap_sizes = is_na.groupby(gap_id).transform("sum")
                 interp = s.interpolate(method="linear", limit=max_gap,
                                        limit_direction="forward")
-                df[col] = np.where((~notna) & (gap_sizes > max_gap), np.nan, interp)
+                df[col] = interp
+                df.loc[is_na & (gap_sizes > max_gap), col] = np.nan
         return df
     
     
@@ -186,32 +219,76 @@ for INPUT_CSV in INPUT_DIR.glob("*.csv"):
         return score
     
     
-    def detect_bouts(df: pd.DataFrame,
-                     motion_thresh: float,
-                     roll_window: int,
-                     dilation: int,
-                     min_frames: int):
-        score = build_motion_score(df)
-        smooth_score = score.rolling(roll_window, center=True, min_periods=1).median()
-    
-        active = (smooth_score >= motion_thresh).values
-        # morphological dilation: join gaps ≤ dilation frames
-        struct = np.ones(dilation * 2 + 1, dtype=bool)
-        active = binary_dilation(active, structure=struct)
-        # mild erosion to remove stray single frames at edges
-        active = binary_erosion(active, structure=np.ones(3, dtype=bool))
-    
+    def _hysteresis_active_mask(smooth_score: pd.Series,
+                                on_thresh: float,
+                                off_thresh: float) -> np.ndarray:
+        """
+        Start activity at the higher threshold, then keep the bout active until
+        the score falls below the lower threshold. This prevents a long W06
+        stepping run from being split at every brief low-velocity phase.
+        """
+        active = np.zeros(len(smooth_score), dtype=bool)
+        in_bout = False
+        for i, val in enumerate(smooth_score.values):
+            if val >= on_thresh:
+                in_bout = True
+            elif val < off_thresh:
+                in_bout = False
+            active[i] = in_bout
+        return active
+
+
+    def _merge_short_inactive_gaps(active: np.ndarray, max_gap: int) -> np.ndarray:
+        """Fill inactive gaps of up to max_gap frames between active regions."""
+        if max_gap <= 0 or not active.any():
+            return active
+
+        merged = active.copy()
+        inactive = ~active
+        labeled, n_gaps = label(inactive)
+        for i in range(1, n_gaps + 1):
+            idx = np.where(labeled == i)[0]
+            if len(idx) == 0 or len(idx) > max_gap:
+                continue
+            has_active_before = idx[0] > 0 and active[idx[0] - 1]
+            has_active_after = idx[-1] < len(active) - 1 and active[idx[-1] + 1]
+            if has_active_before and has_active_after:
+                merged[idx] = True
+        return merged
+
+
+    def _label_bouts(active: np.ndarray, min_frames: int):
         labeled, n_raw = label(active)
-        bout_mask = np.zeros(len(df), dtype=bool)
-        bout_ids  = np.zeros(len(df), dtype=int)
-        bout_num  = 0
+        bout_mask = np.zeros(len(active), dtype=bool)
+        bout_ids = np.zeros(len(active), dtype=int)
+        bout_num = 0
         for i in range(1, n_raw + 1):
             idx = np.where(labeled == i)[0]
             if len(idx) >= min_frames:
                 bout_num += 1
                 bout_mask[idx] = True
-                bout_ids[idx]  = bout_num
-    
+                bout_ids[idx] = bout_num
+        return bout_mask, bout_ids
+
+
+    def detect_bouts(df: pd.DataFrame,
+                     motion_thresh: float,
+                     motion_off_thresh: float,
+                     roll_window: int,
+                     dilation: int,
+                     max_inactive_gap: int,
+                     min_frames: int):
+        score = build_motion_score(df)
+        smooth_score = score.rolling(roll_window, center=True, min_periods=1).median()
+
+        active = _hysteresis_active_mask(smooth_score, motion_thresh, motion_off_thresh)
+        if dilation > 0:
+            struct = np.ones(dilation * 2 + 1, dtype=bool)
+            active = binary_dilation(active, structure=struct)
+            active = binary_erosion(active, structure=np.ones(3, dtype=bool))
+        active = _merge_short_inactive_gaps(active, max_inactive_gap)
+        bout_mask, bout_ids = _label_bouts(active, min_frames)
+
         return bout_mask, bout_ids, smooth_score
     
     
@@ -243,6 +320,113 @@ for INPUT_CSV in INPUT_DIR.glob("*.csv"):
             except Exception:
                 quality[b] = 0.0
         return quality
+
+
+    def count_steps_in_signal(sig: np.ndarray,
+                              frame_rate: float,
+                              min_interval_sec: float) -> int:
+        """
+        Count repeated foot x cycles inside a bout. The treadmill signal is
+        sawtooth-like, so local maxima in the smoothed foot x trace are a
+        practical same-foot step-cycle estimate.
+        """
+        sig = pd.Series(sig).interpolate(limit_direction="both").ffill().bfill().values
+        if len(sig) < 5 or np.all(np.isnan(sig)):
+            return 0
+
+        w = min(11, len(sig))
+        if w % 2 == 0:
+            w -= 1
+        if w >= 5:
+            sig = savgol_filter(sig, w, min(3, w - 2))
+
+        sig_range = np.nanpercentile(sig, 95) - np.nanpercentile(sig, 5)
+        if not np.isfinite(sig_range) or sig_range < 1e-6:
+            return 0
+
+        centered = sig - np.nanmedian(sig)
+        min_distance = max(1, int(round(frame_rate * min_interval_sec)))
+        prominence = max(sig_range * 0.08, np.nanstd(centered) * 0.20)
+        peaks, _ = find_peaks(centered, distance=min_distance, prominence=prominence)
+        troughs, _ = find_peaks(-centered, distance=min_distance, prominence=prominence)
+        return int(max(len(peaks), len(troughs)))
+
+
+    def build_bout_step_counts(df: pd.DataFrame,
+                               bout_ids: np.ndarray,
+                               frame_rate: float,
+                               min_interval_sec: float) -> dict:
+        step_counts = {}
+        for b in np.unique(bout_ids[bout_ids > 0]):
+            idx = np.where(bout_ids == b)[0]
+            foot_steps = count_steps_in_signal(
+                df["foot_x"].iloc[idx].values,
+                frame_rate=frame_rate,
+                min_interval_sec=min_interval_sec,
+            )
+            ankle_steps = count_steps_in_signal(
+                df["ankle_x"].iloc[idx].values,
+                frame_rate=frame_rate,
+                min_interval_sec=min_interval_sec,
+            )
+            step_counts[b] = max(foot_steps, ankle_steps)
+        return step_counts
+
+
+    def filter_bouts_by_step_count(bout_ids: np.ndarray,
+                                   step_counts: dict,
+                                   min_steps: int):
+        if min_steps <= 0:
+            return bout_ids > 0, bout_ids
+
+        keep = {b for b, n_steps in step_counts.items() if n_steps >= min_steps}
+        filtered_ids = np.zeros(len(bout_ids), dtype=int)
+        next_id = 0
+        for b in np.unique(bout_ids[bout_ids > 0]):
+            if b not in keep:
+                continue
+            next_id += 1
+            filtered_ids[bout_ids == b] = next_id
+        return filtered_ids > 0, filtered_ids
+
+
+    def build_bout_metadata(df_raw: pd.DataFrame,
+                            bout_ids: np.ndarray,
+                            quality: dict,
+                            step_counts: dict,
+                            frame_rate: float) -> pd.DataFrame:
+        rows = []
+        total_frames = len(df_raw)
+        total_duration_sec = total_frames / frame_rate if frame_rate > 0 else np.nan
+        for b in np.unique(bout_ids[bout_ids > 0]):
+            idx = np.where(bout_ids == b)[0]
+            fr = df_raw["frame"].iloc[idx]
+            n_frames = len(idx)
+            duration_sec = n_frames / frame_rate if frame_rate > 0 else np.nan
+            n_steps = int(step_counts.get(b, 0))
+            step_frequency_hz = (
+                n_steps / duration_sec
+                if duration_sec and np.isfinite(duration_sec) and duration_sec > 0
+                else np.nan
+            )
+            duration_total_fraction = (
+                duration_sec / total_duration_sec
+                if total_duration_sec and np.isfinite(total_duration_sec) and total_duration_sec > 0
+                else np.nan
+            )
+            rows.append({
+                "bout_id":                 b,
+                "start_frame":             int(fr.iloc[0]),
+                "end_frame":               int(fr.iloc[-1]),
+                "n_frames":                n_frames,
+                "duration_sec":            duration_sec,
+                "duration_total_fraction": duration_total_fraction,
+                "n_steps":                 n_steps,
+                "step_frequency_hz":       step_frequency_hz,
+                "step_quality":            quality.get(b, 0.0),
+                "bout_type":               "stepping" if quality.get(b, 0) >= STEP_QUALITY_BAND_FRAC else "dragging/irregular",
+            })
+        return pd.DataFrame(rows)
     
     
     # ── 7. SMOOTHING ──────────────────────────────────────────────
@@ -270,10 +454,20 @@ for INPUT_CSV in INPUT_DIR.glob("*.csv"):
     
     # ── 8. EXPORT ─────────────────────────────────────────────────
     def build_cleaned_df(df: pd.DataFrame, bout_mask: np.ndarray,
-                         bout_ids: np.ndarray, quality: dict) -> pd.DataFrame:
+                         bout_ids: np.ndarray, quality: dict,
+                         bout_meta: pd.DataFrame) -> pd.DataFrame:
         out = df[bout_mask].copy()
         out["bout_id"] = bout_ids[bout_mask]
         out["step_quality"] = out["bout_id"].map(quality)
+        if not bout_meta.empty:
+            meta_cols = [
+                "bout_id",
+                "duration_sec",
+                "duration_total_fraction",
+                "n_steps",
+                "step_frequency_hz",
+            ]
+            out = out.merge(bout_meta[meta_cols], on="bout_id", how="left")
         return out
     
     
@@ -433,7 +627,7 @@ for INPUT_CSV in INPUT_DIR.glob("*.csv"):
     
     
     # ─────────────────────── SUMMARY ────────────────────────────────
-    def print_summary(df_raw, df_clean, bout_ids, parts, quality):
+    def print_summary(df_raw, df_clean, bout_ids, parts, quality, bout_meta):
         total = len(df_raw)
         kept  = (bout_ids > 0).sum()
         ubouts = np.unique(bout_ids[bout_ids > 0])
@@ -445,14 +639,23 @@ for INPUT_CSV in INPUT_DIR.glob("*.csv"):
         print(f"  Frames excluded    : {total-kept}  ({100*(total-kept)/total:.1f}%)")
         print(f"  Valid bouts found  : {len(ubouts)}")
         print()
-        print(f"  {'Bout':>5}  {'Start':>6}  {'End':>6}  {'Frames':>7}  {'Quality':>9}  {'Type'}")
-        print(f"  {'-'*55}")
+        print(f"  {'Bout':>5}  {'Start':>6}  {'End':>6}  {'Frames':>7}  {'Sec':>7}  {'Steps':>6}  {'Hz':>6}  {'%Rec':>6}  {'Quality':>9}  {'Type'}")
+        print(f"  {'-'*95}")
         for b in ubouts:
             idx = np.where(bout_ids == b)[0]
             fr  = df_raw["frame"].iloc[idx]
             q   = quality.get(b, 0)
+            meta = bout_meta.loc[bout_meta["bout_id"] == b].iloc[0] if not bout_meta.empty else {}
+            duration_sec = meta.get("duration_sec", np.nan) if hasattr(meta, "get") else np.nan
+            n_steps = meta.get("n_steps", 0) if hasattr(meta, "get") else 0
+            step_frequency_hz = meta.get("step_frequency_hz", np.nan) if hasattr(meta, "get") else np.nan
+            duration_pct = 100 * meta.get("duration_total_fraction", np.nan) if hasattr(meta, "get") else np.nan
             btype = "stepping" if q >= STEP_QUALITY_BAND_FRAC else "dragging/irregular"
-            print(f"  {b:>5}  {fr.iloc[0]:>6}  {fr.iloc[-1]:>6}  {len(idx):>7}  {q:>9.3f}  {btype}")
+            print(
+                f"  {b:>5}  {fr.iloc[0]:>6}  {fr.iloc[-1]:>6}  {len(idx):>7}  "
+                f"{duration_sec:>7.2f}  {n_steps:>6}  {step_frequency_hz:>6.2f}  "
+                f"{duration_pct:>6.2f}  {q:>9.3f}  {btype}"
+            )
         print()
         print(f"  NaN rates in cleaned output:")
         for p in parts:
@@ -468,10 +671,34 @@ for INPUT_CSV in INPUT_DIR.glob("*.csv"):
         print(f"{'─'*60}")
         print(f"  Gait Cleaning Pipeline  |  DLC Treadmill Mouse")
         print(f"{'─'*60}")
+        OUT_DIR.mkdir(parents=True, exist_ok=True)
     
         print(f"\n[1/8] Parsing DLC CSV…")
         df_raw, parts = parse_dlc_csv(INPUT_CSV)
         print(f"      {len(df_raw)} frames  |  bodyparts: {parts}")
+        likelihood_cols = [f"{p}_likelihood" for p in parts if f"{p}_likelihood" in df_raw.columns]
+        mean_raw_likelihood = df_raw[likelihood_cols].mean().mean() if likelihood_cols else np.nan
+        high_confidence_tracking = (
+            np.isfinite(mean_raw_likelihood)
+            and mean_raw_likelihood >= HIGH_CONFIDENCE_MEAN_LIKELIHOOD
+        )
+        if high_confidence_tracking:
+            detect_roll_window = MOTION_ROLL_WINDOW
+            detect_off_thresh = MOTION_OFF_THRESH
+            detect_dilation = MOTION_DILATION_FRAMES
+            detect_max_gap = MAX_INACTIVE_GAP_FRAMES
+            detect_min_frames = MIN_BOUT_FRAMES
+            detect_min_steps = MIN_STEPS_PER_BOUT
+            detect_mode = "high-confidence sustained stepping"
+        else:
+            detect_roll_window = LEGACY_MOTION_ROLL_WINDOW
+            detect_off_thresh = LEGACY_MOTION_OFF_THRESH
+            detect_dilation = LEGACY_MOTION_DILATION_FRAMES
+            detect_max_gap = LEGACY_MAX_INACTIVE_GAP_FRAMES
+            detect_min_frames = LEGACY_MIN_BOUT_FRAMES
+            detect_min_steps = LEGACY_MIN_STEPS_PER_BOUT
+            detect_mode = "legacy low-confidence"
+        print(f"      mean raw likelihood={mean_raw_likelihood:.3f}  |  mode: {detect_mode}")
     
         print(f"\n[2/8] Likelihood filtering…")
         df = apply_likelihood_filter(df_raw, parts, LIKELIHOOD_THRESH)
@@ -495,40 +722,50 @@ for INPUT_CSV in INPUT_DIR.glob("*.csv"):
         bout_mask, bout_ids, smooth_score = detect_bouts(
             df,
             motion_thresh=MOTION_THRESH,
-            roll_window=MOTION_ROLL_WINDOW,
-            dilation=MOTION_DILATION_FRAMES,
-            min_frames=MIN_BOUT_FRAMES,
+            motion_off_thresh=detect_off_thresh,
+            roll_window=detect_roll_window,
+            dilation=detect_dilation,
+            max_inactive_gap=detect_max_gap,
+            min_frames=detect_min_frames,
+        )
+        preliminary_steps = build_bout_step_counts(
+            df,
+            bout_ids,
+            frame_rate=FRAME_RATE,
+            min_interval_sec=MIN_STEP_INTERVAL_SEC,
+        )
+        bout_mask, bout_ids = filter_bouts_by_step_count(
+            bout_ids,
+            preliminary_steps,
+            min_steps=detect_min_steps,
         )
         ubouts = np.unique(bout_ids[bout_ids > 0])
+        step_counts = build_bout_step_counts(
+            df,
+            bout_ids,
+            frame_rate=FRAME_RATE,
+            min_interval_sec=MIN_STEP_INTERVAL_SEC,
+        )
         print(f"      Found {len(ubouts)} valid bouts  ({bout_mask.sum()} frames total)")
+        print(f"      Merged inactive gaps <= {detect_max_gap} frames")
+        if detect_min_steps > 0:
+            print(f"      Removed candidate bouts with < {detect_min_steps} detected steps")
+        else:
+            print(f"      Step count filtering disabled; step counts are reported as features")
     
         print(f"\n[6/8] Scoring bout periodicity (step quality)…")
         quality = score_bout_periodicity(df, bout_ids, STEP_QUALITY_BAND_FRAC)
         for b, q in quality.items():
             btype = "stepping" if q >= STEP_QUALITY_BAND_FRAC else "dragging/irregular"
-            print(f"      Bout {b:2d}: quality={q:.3f}  → {btype}")
+            print(f"      Bout {b:2d}: steps={step_counts.get(b, 0):2d}  quality={q:.3f}  → {btype}")
     
         print(f"\n[7/8] Smoothing within bouts (SG w={SG_WINDOW}, poly={SG_POLY})…")
         df_smoothed = smooth_bouts(df, parts, bout_ids, SG_WINDOW, SG_POLY)
     
         print(f"\n[8/8] Exporting outputs to {OUT_DIR}/")
-        df_clean = build_cleaned_df(df_smoothed, bout_mask, bout_ids, quality)
+        bout_meta = build_bout_metadata(df_raw, bout_ids, quality, step_counts, FRAME_RATE)
+        df_clean = build_cleaned_df(df_smoothed, bout_mask, bout_ids, quality, bout_meta)
         df_clean.to_csv(OUT_DIR / f"{INPUT_CSV.stem}_cleaned_gait_data.csv", index=False)
-    
-        # Bout metadata
-        rows = []
-        for b in ubouts:
-            idx = np.where(bout_ids == b)[0]
-            fr  = df_raw["frame"].iloc[idx]
-            rows.append({
-                "bout_id":      b,
-                "start_frame":  int(fr.iloc[0]),
-                "end_frame":    int(fr.iloc[-1]),
-                "n_frames":     len(idx),
-                "step_quality": quality.get(b, 0.0),
-                "bout_type":    "stepping" if quality.get(b, 0) >= STEP_QUALITY_BAND_FRAC else "dragging/irregular",
-            })
-        bout_meta = pd.DataFrame(rows)
         bout_meta.to_csv(OUT_DIR / f"{INPUT_CSV.stem}_bout_metadata.csv", index=False)
     
         print("      Generating diagnostic plots…")
@@ -539,9 +776,9 @@ for INPUT_CSV in INPUT_DIR.glob("*.csv"):
         plot_step_quality(quality, bout_meta, OUT_DIR)
         plot_sample_bouts(df_clean, parts, quality, OUT_DIR)
     
-        print_summary(df_raw, df_clean, bout_ids, parts, quality)
+        print_summary(df_raw, df_clean, bout_ids, parts, quality, bout_meta)
         print(f"\n  Output files:")
-        print(f"    {INPUT_CSV.stem}_cleaned.csv  — per-frame cleaned coords + bout_id + step_quality")
+        print(f"    {INPUT_CSV.stem}_cleaned_gait_data.csv  — per-frame cleaned coords + bout features")
         print(f"    {INPUT_CSV.stem}_bout_metadata.csv      — bout-level summary")
         print(f"    {INPUT_CSV.stem}_01_likelihood_filtering.png")
         print(f"    {INPUT_CSV.stem}_02_motion_bouts.png")
