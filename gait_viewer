@@ -1,0 +1,888 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Gait Viewer</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f5f7f8;
+      --panel: #ffffff;
+      --panel-soft: #eef3f4;
+      --ink: #162124;
+      --muted: #5d6d72;
+      --line: #cfdbde;
+      --accent: #087f8c;
+      --accent-2: #c44536;
+      --accent-3: #2f6f3e;
+      --shadow: 0 18px 45px rgba(19, 39, 45, 0.12);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    button,
+    input,
+    select {
+      font: inherit;
+    }
+
+    .app {
+      min-height: 100vh;
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 14px 18px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.94);
+      position: sticky;
+      top: 0;
+      z-index: 5;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 18px;
+      font-weight: 760;
+      letter-spacing: 0;
+    }
+
+    .status {
+      color: var(--muted);
+      font-size: 13px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 50vw;
+    }
+
+    main {
+      display: grid;
+      grid-template-columns: minmax(280px, 340px) 1fr;
+      gap: 14px;
+      padding: 14px;
+      min-height: 0;
+    }
+
+    aside,
+    .stage {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+    }
+
+    aside {
+      padding: 12px;
+      overflow: auto;
+    }
+
+    .stage {
+      min-width: 0;
+      min-height: 0;
+      display: grid;
+      grid-template-rows: minmax(300px, 1fr) auto;
+      overflow: hidden;
+    }
+
+    .viewer-grid {
+      min-height: 0;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1px;
+      background: var(--line);
+    }
+
+    .pane {
+      min-width: 0;
+      min-height: 0;
+      background: #101719;
+      position: relative;
+      display: grid;
+      grid-template-rows: auto 1fr;
+    }
+
+    .pane-title {
+      color: #dce7e9;
+      background: rgba(0, 0, 0, 0.38);
+      padding: 8px 10px;
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      z-index: 2;
+    }
+
+    .canvas-wrap,
+    .video-wrap {
+      position: relative;
+      min-height: 0;
+      overflow: hidden;
+    }
+
+    canvas,
+    video {
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+
+    video {
+      object-fit: contain;
+      background: #0d1315;
+    }
+
+    #overlayCanvas {
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+    }
+
+    .empty {
+      position: absolute;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      color: #9fb0b4;
+      font-size: 14px;
+      text-align: center;
+      padding: 24px;
+    }
+
+    .group {
+      border-top: 1px solid var(--line);
+      padding-top: 12px;
+      margin-top: 12px;
+    }
+
+    .group:first-child {
+      border-top: 0;
+      padding-top: 0;
+      margin-top: 0;
+    }
+
+    .group-title {
+      margin: 0 0 8px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+
+    .field {
+      display: grid;
+      gap: 6px;
+      margin-bottom: 10px;
+    }
+
+    label {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    select,
+    input[type="number"],
+    input[type="file"] {
+      width: 100%;
+      min-height: 34px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: white;
+      color: var(--ink);
+      padding: 6px 8px;
+    }
+
+    input[type="range"] {
+      width: 100%;
+      accent-color: var(--accent);
+    }
+
+    .row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+
+    .toggles {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+
+    .check {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 32px;
+      padding: 6px 8px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel-soft);
+      color: var(--ink);
+      font-size: 13px;
+      font-weight: 650;
+    }
+
+    .buttons {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 8px;
+    }
+
+    button {
+      min-height: 36px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: white;
+      color: var(--ink);
+      cursor: pointer;
+      font-weight: 800;
+    }
+
+    button.primary {
+      background: var(--accent);
+      color: white;
+      border-color: var(--accent);
+    }
+
+    button:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+
+    .stats {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+
+    .metric {
+      background: var(--panel-soft);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 8px;
+      min-width: 0;
+    }
+
+    .metric .k {
+      display: block;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+
+    .metric .v {
+      display: block;
+      margin-top: 2px;
+      font-size: 17px;
+      font-weight: 820;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .timeline {
+      padding: 12px;
+      border-top: 1px solid var(--line);
+      background: #ffffff;
+      display: grid;
+      gap: 8px;
+    }
+
+    .timeline-top {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .bout-strip {
+      height: 18px;
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      overflow: hidden;
+      background: var(--panel-soft);
+      position: relative;
+    }
+
+    .bout {
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      background: var(--accent);
+      opacity: 0.65;
+      border-right: 1px solid rgba(255, 255, 255, 0.7);
+    }
+
+    @media (max-width: 900px) {
+      main {
+        grid-template-columns: 1fr;
+      }
+
+      .viewer-grid {
+        grid-template-columns: 1fr;
+        grid-template-rows: minmax(320px, 1fr) minmax(240px, 0.7fr);
+      }
+
+      .status {
+        max-width: 42vw;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header>
+      <h1>Gait Viewer</h1>
+      <div class="status" id="status">Load a gait CSV to begin</div>
+    </header>
+
+    <main>
+      <aside>
+        <section class="group">
+          <p class="group-title">Data</p>
+          <div class="field">
+            <label for="presetSelect">Workspace CSV</label>
+            <select id="presetSelect">
+              <option value="">Choose a generated file</option>
+              <option value="Cleaned/%2302_W06_140907_15.10_10.97_8.14_5.61_2.94_TV1DLC_resnet50_W06-DLCApr13shuffle1_50000_filtered_cleaned_gait_data.csv">W06 cleaned gait</option>
+              <option value="Cleaned/%237_W00_140721_15.10_TV1DLC_Resnet50_W00-DLCApr30shuffle1_snapshot_best-90_filtered_cleaned_gait_data.csv">W00 cleaned gait</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="csvInput">CSV file</label>
+            <input id="csvInput" type="file" accept=".csv,text/csv">
+          </div>
+          <div class="field">
+            <label for="videoInput">Video file</label>
+            <input id="videoInput" type="file" accept="video/*">
+          </div>
+        </section>
+
+        <section class="group">
+          <p class="group-title">Playback</p>
+          <div class="buttons">
+            <button id="backBtn" title="Previous frame">-1</button>
+            <button id="playBtn" class="primary" title="Play or pause">Play</button>
+            <button id="forwardBtn" title="Next frame">+1</button>
+            <button id="syncBtn" title="Set video time from current frame">Sync</button>
+          </div>
+          <div class="field">
+            <label for="frameSlider">Frame</label>
+            <input id="frameSlider" type="range" min="0" max="0" value="0">
+          </div>
+          <div class="row">
+            <div class="field">
+              <label for="fpsInput">FPS</label>
+              <input id="fpsInput" type="number" min="1" step="0.01" value="15.10">
+            </div>
+            <div class="field">
+              <label for="offsetInput">Video offset sec</label>
+              <input id="offsetInput" type="number" step="0.05" value="0">
+            </div>
+          </div>
+          <div class="row">
+            <div class="field">
+              <label for="speedInput">Speed</label>
+              <input id="speedInput" type="number" min="0.05" max="4" step="0.05" value="1">
+            </div>
+            <div class="field">
+              <label for="trailInput">Trail frames</label>
+              <input id="trailInput" type="number" min="0" max="120" step="1" value="18">
+            </div>
+          </div>
+        </section>
+
+        <section class="group">
+          <p class="group-title">View</p>
+          <div class="toggles">
+            <label class="check"><input id="overlayToggle" type="checkbox" checked> Overlay</label>
+            <label class="check"><input id="labelsToggle" type="checkbox" checked> Labels</label>
+            <label class="check"><input id="trailToggle" type="checkbox" checked> Trails</label>
+            <label class="check"><input id="invertToggle" type="checkbox"> Flip y</label>
+          </div>
+        </section>
+
+        <section class="group">
+          <p class="group-title">Current</p>
+          <div class="stats">
+            <div class="metric"><span class="k">Frame</span><span class="v" id="mFrame">-</span></div>
+            <div class="metric"><span class="k">Bout</span><span class="v" id="mBout">-</span></div>
+            <div class="metric"><span class="k">Quality</span><span class="v" id="mQuality">-</span></div>
+            <div class="metric"><span class="k">Step Hz</span><span class="v" id="mHz">-</span></div>
+            <div class="metric"><span class="k">Steps</span><span class="v" id="mSteps">-</span></div>
+            <div class="metric"><span class="k">Duration</span><span class="v" id="mDuration">-</span></div>
+          </div>
+        </section>
+      </aside>
+
+      <section class="stage">
+        <div class="viewer-grid">
+          <div class="pane">
+            <div class="pane-title">Skeleton</div>
+            <div class="canvas-wrap">
+              <canvas id="skeletonCanvas"></canvas>
+              <div class="empty" id="skeletonEmpty">No CSV loaded</div>
+            </div>
+          </div>
+          <div class="pane">
+            <div class="pane-title">Video</div>
+            <div class="video-wrap">
+              <video id="video" controls muted playsinline></video>
+              <canvas id="overlayCanvas"></canvas>
+              <div class="empty" id="videoEmpty">No video loaded</div>
+            </div>
+          </div>
+        </div>
+        <div class="timeline">
+          <div class="timeline-top">
+            <span id="timeReadout">0.00 s</span>
+            <span id="fileReadout">No file</span>
+          </div>
+          <div class="bout-strip" id="boutStrip"></div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    const PARTS = ["back", "pelvis", "knee", "ankle", "foot"];
+    const BONES = [["back", "pelvis"], ["pelvis", "knee"], ["knee", "ankle"], ["ankle", "foot"]];
+    const COLORS = {
+      back: "#f2c14e",
+      pelvis: "#5bc0eb",
+      knee: "#8bc34a",
+      ankle: "#ff7a59",
+      foot: "#f25f5c"
+    };
+
+    const state = {
+      rows: [],
+      frameIndex: 0,
+      playing: false,
+      lastTick: 0,
+      bounds: null,
+      fileName: "",
+      videoUrl: null
+    };
+
+    const el = {
+      status: document.getElementById("status"),
+      presetSelect: document.getElementById("presetSelect"),
+      csvInput: document.getElementById("csvInput"),
+      videoInput: document.getElementById("videoInput"),
+      frameSlider: document.getElementById("frameSlider"),
+      fpsInput: document.getElementById("fpsInput"),
+      offsetInput: document.getElementById("offsetInput"),
+      speedInput: document.getElementById("speedInput"),
+      trailInput: document.getElementById("trailInput"),
+      overlayToggle: document.getElementById("overlayToggle"),
+      labelsToggle: document.getElementById("labelsToggle"),
+      trailToggle: document.getElementById("trailToggle"),
+      invertToggle: document.getElementById("invertToggle"),
+      playBtn: document.getElementById("playBtn"),
+      backBtn: document.getElementById("backBtn"),
+      forwardBtn: document.getElementById("forwardBtn"),
+      syncBtn: document.getElementById("syncBtn"),
+      skeletonCanvas: document.getElementById("skeletonCanvas"),
+      overlayCanvas: document.getElementById("overlayCanvas"),
+      skeletonEmpty: document.getElementById("skeletonEmpty"),
+      videoEmpty: document.getElementById("videoEmpty"),
+      video: document.getElementById("video"),
+      boutStrip: document.getElementById("boutStrip"),
+      timeReadout: document.getElementById("timeReadout"),
+      fileReadout: document.getElementById("fileReadout"),
+      mFrame: document.getElementById("mFrame"),
+      mBout: document.getElementById("mBout"),
+      mQuality: document.getElementById("mQuality"),
+      mHz: document.getElementById("mHz"),
+      mSteps: document.getElementById("mSteps"),
+      mDuration: document.getElementById("mDuration")
+    };
+
+    function parseCsv(text) {
+      return text.trim().split(/\r?\n/).map(line => line.split(","));
+    }
+
+    function numeric(value) {
+      const n = Number(value);
+      return Number.isFinite(n) ? n : NaN;
+    }
+
+    function parseTable(text) {
+      const table = parseCsv(text);
+      if (table.length < 2) return [];
+
+      if (table[0][0] === "scorer" && table[1][0] === "bodyparts") {
+        const bodyparts = table[1].slice(1);
+        const coords = table[2].slice(1);
+        return table.slice(3).map(line => {
+          const row = { frame: numeric(line[0]) };
+          for (let i = 1; i < line.length; i += 1) {
+            row[`${bodyparts[i - 1]}_${coords[i - 1]}`] = numeric(line[i]);
+          }
+          return row;
+        }).filter(row => Number.isFinite(row.frame));
+      }
+
+      const headers = table[0];
+      return table.slice(1).map(line => {
+        const row = {};
+        headers.forEach((h, i) => {
+          row[h] = i === 0 || h !== "bout_type" ? numeric(line[i]) : line[i];
+        });
+        return row;
+      }).filter(row => Number.isFinite(row.frame));
+    }
+
+    function computeBounds(rows) {
+      const xs = [];
+      const ys = [];
+      rows.forEach(row => {
+        PARTS.forEach(part => {
+          const x = row[`${part}_x`];
+          const y = row[`${part}_y`];
+          if (Number.isFinite(x) && Number.isFinite(y)) {
+            xs.push(x);
+            ys.push(y);
+          }
+        });
+      });
+      if (!xs.length) return { minX: 0, maxX: 1, minY: 0, maxY: 1 };
+      const minX = Math.min(...xs);
+      const maxX = Math.max(...xs);
+      const minY = Math.min(...ys);
+      const maxY = Math.max(...ys);
+      const padX = Math.max((maxX - minX) * 0.12, 10);
+      const padY = Math.max((maxY - minY) * 0.18, 10);
+      return {
+        minX: minX - padX,
+        maxX: maxX + padX,
+        minY: minY - padY,
+        maxY: maxY + padY
+      };
+    }
+
+    function resizeCanvas(canvas) {
+      const rect = canvas.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      const width = Math.max(1, Math.round(rect.width * dpr));
+      const height = Math.max(1, Math.round(rect.height * dpr));
+      if (canvas.width !== width || canvas.height !== height) {
+        canvas.width = width;
+        canvas.height = height;
+      }
+      return { width, height, dpr };
+    }
+
+    function project(row, canvas, bounds) {
+      const { width, height } = canvas;
+      const spanX = bounds.maxX - bounds.minX || 1;
+      const spanY = bounds.maxY - bounds.minY || 1;
+      const scale = Math.min(width / spanX, height / spanY);
+      const drawW = spanX * scale;
+      const drawH = spanY * scale;
+      const ox = (width - drawW) / 2;
+      const oy = (height - drawH) / 2;
+      const flip = el.invertToggle.checked;
+      const points = {};
+      PARTS.forEach(part => {
+        const x = row[`${part}_x`];
+        const y = row[`${part}_y`];
+        if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+        points[part] = {
+          x: ox + (x - bounds.minX) * scale,
+          y: flip ? oy + (bounds.maxY - y) * scale : oy + (y - bounds.minY) * scale,
+          likelihood: row[`${part}_likelihood`]
+        };
+      });
+      return points;
+    }
+
+    function drawSkeleton(canvas, row, options = {}) {
+      resizeCanvas(canvas);
+      const ctx = canvas.getContext("2d");
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      if (!state.rows.length || !state.bounds) {
+        return;
+      }
+
+      const bounds = state.bounds;
+      const bg = options.transparent ? "transparent" : "#101719";
+      if (!options.transparent) {
+        ctx.fillStyle = bg;
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        drawGrid(ctx, canvas);
+      }
+
+      if (el.trailToggle.checked && !options.noTrail) {
+        drawTrail(ctx, canvas, bounds);
+      }
+
+      const points = project(row, canvas, bounds);
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      BONES.forEach(([a, b]) => {
+        if (!points[a] || !points[b]) return;
+        ctx.strokeStyle = options.overlay ? "rgba(255, 255, 255, 0.88)" : "#dbe8ea";
+        ctx.lineWidth = options.overlay ? 5 : 4;
+        ctx.beginPath();
+        ctx.moveTo(points[a].x, points[a].y);
+        ctx.lineTo(points[b].x, points[b].y);
+        ctx.stroke();
+      });
+
+      PARTS.forEach(part => {
+        const pt = points[part];
+        if (!pt) return;
+        const likelihood = Number.isFinite(pt.likelihood) ? Math.max(0.25, Math.min(1, pt.likelihood)) : 1;
+        ctx.globalAlpha = likelihood;
+        ctx.fillStyle = COLORS[part];
+        ctx.strokeStyle = "#0d1315";
+        ctx.lineWidth = options.overlay ? 2 : 3;
+        ctx.beginPath();
+        ctx.arc(pt.x, pt.y, options.overlay ? 7 : 8, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+        if (el.labelsToggle.checked && !options.overlay) {
+          ctx.fillStyle = "#dbe8ea";
+          ctx.font = `${12 * (window.devicePixelRatio || 1)}px ui-sans-serif`;
+          ctx.fillText(part, pt.x + 10, pt.y - 10);
+        }
+      });
+    }
+
+    function drawGrid(ctx, canvas) {
+      ctx.save();
+      ctx.strokeStyle = "rgba(255, 255, 255, 0.08)";
+      ctx.lineWidth = 1;
+      const step = Math.max(40, Math.floor(canvas.width / 8));
+      for (let x = 0; x <= canvas.width; x += step) {
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, canvas.height);
+        ctx.stroke();
+      }
+      for (let y = 0; y <= canvas.height; y += step) {
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(canvas.width, y);
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+
+    function drawTrail(ctx, canvas, bounds) {
+      const trail = Math.max(0, Number(el.trailInput.value) || 0);
+      const start = Math.max(0, state.frameIndex - trail);
+      for (let i = start; i < state.frameIndex; i += 1) {
+        const alpha = (i - start + 1) / Math.max(1, state.frameIndex - start + 1);
+        const points = project(state.rows[i], canvas, bounds);
+        const foot = points.foot;
+        const ankle = points.ankle;
+        ctx.fillStyle = `rgba(242, 95, 92, ${0.12 + alpha * 0.28})`;
+        if (foot) {
+          ctx.beginPath();
+          ctx.arc(foot.x, foot.y, 3 + alpha * 3, 0, Math.PI * 2);
+          ctx.fill();
+        }
+        ctx.fillStyle = `rgba(255, 122, 89, ${0.10 + alpha * 0.22})`;
+        if (ankle) {
+          ctx.beginPath();
+          ctx.arc(ankle.x, ankle.y, 2 + alpha * 2, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+    }
+
+    function setFrame(index, syncVideo = false) {
+      if (!state.rows.length) return;
+      state.frameIndex = Math.max(0, Math.min(state.rows.length - 1, index));
+      el.frameSlider.value = String(state.frameIndex);
+      if (syncVideo && el.video.src) {
+        const fps = Number(el.fpsInput.value) || 15.1;
+        const offset = Number(el.offsetInput.value) || 0;
+        el.video.currentTime = Math.max(0, state.rows[state.frameIndex].frame / fps + offset);
+      }
+      render();
+    }
+
+    function render() {
+      const row = state.rows[state.frameIndex];
+      el.skeletonEmpty.style.display = state.rows.length ? "none" : "grid";
+      el.videoEmpty.style.display = el.video.src ? "none" : "grid";
+      if (!row) {
+        drawSkeleton(el.skeletonCanvas, {}, {});
+        return;
+      }
+
+      drawSkeleton(el.skeletonCanvas, row);
+      resizeCanvas(el.overlayCanvas);
+      const overlayCtx = el.overlayCanvas.getContext("2d");
+      overlayCtx.clearRect(0, 0, el.overlayCanvas.width, el.overlayCanvas.height);
+      if (el.overlayToggle.checked && el.video.src) {
+        drawSkeleton(el.overlayCanvas, row, { overlay: true, transparent: true, noTrail: true });
+      }
+
+      const fps = Number(el.fpsInput.value) || 15.1;
+      el.timeReadout.textContent = `${(row.frame / fps).toFixed(2)} s`;
+      el.mFrame.textContent = Number.isFinite(row.frame) ? String(row.frame) : "-";
+      el.mBout.textContent = Number.isFinite(row.bout_id) ? String(row.bout_id) : "-";
+      el.mQuality.textContent = Number.isFinite(row.step_quality) ? row.step_quality.toFixed(3) : "-";
+      el.mHz.textContent = Number.isFinite(row.step_frequency_hz) ? row.step_frequency_hz.toFixed(2) : "-";
+      el.mSteps.textContent = Number.isFinite(row.n_steps) ? String(row.n_steps) : "-";
+      el.mDuration.textContent = Number.isFinite(row.duration_sec) ? `${row.duration_sec.toFixed(2)} s` : "-";
+      el.status.textContent = `${state.fileName} | ${state.frameIndex + 1}/${state.rows.length}`;
+    }
+
+    function drawBoutStrip() {
+      el.boutStrip.innerHTML = "";
+      if (!state.rows.length) return;
+      const firstFrame = state.rows[0].frame;
+      const lastFrame = state.rows[state.rows.length - 1].frame;
+      const span = Math.max(1, lastFrame - firstFrame);
+      const byBout = new Map();
+      state.rows.forEach(row => {
+        if (!Number.isFinite(row.bout_id)) return;
+        const key = String(row.bout_id);
+        const existing = byBout.get(key) || { min: row.frame, max: row.frame };
+        existing.min = Math.min(existing.min, row.frame);
+        existing.max = Math.max(existing.max, row.frame);
+        byBout.set(key, existing);
+      });
+      byBout.forEach((range, key) => {
+        const seg = document.createElement("button");
+        seg.className = "bout";
+        seg.title = `Bout ${key}`;
+        seg.style.left = `${((range.min - firstFrame) / span) * 100}%`;
+        seg.style.width = `${Math.max(0.3, ((range.max - range.min + 1) / span) * 100)}%`;
+        seg.addEventListener("click", () => {
+          const idx = state.rows.findIndex(row => row.frame === range.min);
+          setFrame(idx >= 0 ? idx : 0, true);
+        });
+        el.boutStrip.appendChild(seg);
+      });
+    }
+
+    async function loadCsvFromUrl(url, label) {
+      el.status.textContent = `Loading ${label}`;
+      const response = await fetch(url);
+      if (!response.ok) throw new Error(`Could not load ${label}`);
+      const text = await response.text();
+      loadRows(parseTable(text), label);
+    }
+
+    function loadRows(rows, label) {
+      state.rows = rows;
+      state.frameIndex = 0;
+      state.bounds = computeBounds(rows);
+      state.fileName = label;
+      el.frameSlider.max = String(Math.max(0, rows.length - 1));
+      el.frameSlider.value = "0";
+      el.fileReadout.textContent = label;
+      drawBoutStrip();
+      setFrame(0, true);
+    }
+
+    function playLoop(now) {
+      if (!state.playing) return;
+      if (!state.lastTick) state.lastTick = now;
+      const fps = Number(el.fpsInput.value) || 15.1;
+      const speed = Number(el.speedInput.value) || 1;
+      const frameStep = Math.floor(((now - state.lastTick) / 1000) * fps * speed);
+      if (frameStep > 0) {
+        state.lastTick = now;
+        const next = state.frameIndex + frameStep;
+        if (next >= state.rows.length - 1) {
+          state.playing = false;
+          el.playBtn.textContent = "Play";
+          setFrame(state.rows.length - 1, true);
+          return;
+        }
+        setFrame(next, true);
+      }
+      requestAnimationFrame(playLoop);
+    }
+
+    function togglePlay() {
+      if (!state.rows.length) return;
+      state.playing = !state.playing;
+      el.playBtn.textContent = state.playing ? "Pause" : "Play";
+      state.lastTick = 0;
+      if (state.playing) requestAnimationFrame(playLoop);
+    }
+
+    el.presetSelect.addEventListener("change", event => {
+      if (!event.target.value) return;
+      loadCsvFromUrl(event.target.value, event.target.selectedOptions[0].textContent).catch(error => {
+        el.status.textContent = error.message;
+      });
+    });
+
+    el.csvInput.addEventListener("change", event => {
+      const file = event.target.files && event.target.files[0];
+      if (!file) return;
+      file.text().then(text => loadRows(parseTable(text), file.name));
+    });
+
+    el.videoInput.addEventListener("change", event => {
+      const file = event.target.files && event.target.files[0];
+      if (!file) return;
+      if (state.videoUrl) URL.revokeObjectURL(state.videoUrl);
+      state.videoUrl = URL.createObjectURL(file);
+      el.video.src = state.videoUrl;
+      el.videoEmpty.style.display = "none";
+      setFrame(state.frameIndex, true);
+    });
+
+    el.frameSlider.addEventListener("input", event => setFrame(Number(event.target.value), true));
+    el.playBtn.addEventListener("click", togglePlay);
+    el.backBtn.addEventListener("click", () => setFrame(state.frameIndex - 1, true));
+    el.forwardBtn.addEventListener("click", () => setFrame(state.frameIndex + 1, true));
+    el.syncBtn.addEventListener("click", () => setFrame(state.frameIndex, true));
+
+    [
+      el.fpsInput,
+      el.offsetInput,
+      el.speedInput,
+      el.trailInput,
+      el.overlayToggle,
+      el.labelsToggle,
+      el.trailToggle,
+      el.invertToggle
+    ].forEach(control => control.addEventListener("input", () => render()));
+
+    window.addEventListener("resize", render);
+    if (window.location.protocol === "file:") {
+      el.presetSelect.disabled = true;
+      el.presetSelect.title = "Open through a local server to use workspace presets";
+      el.status.textContent = "Open a CSV file to begin";
+    }
+    render();
+  </script>
+</body>
+</html>
